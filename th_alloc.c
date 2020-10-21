@@ -26,7 +26,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
+#include <sys/mman.h>
 
 #define assert(cond) if (!(cond)) __asm__ __volatile__ ("int $3")
 
@@ -75,19 +77,51 @@ static struct superblock_pool levels[LEVELS] = {{NULL, 0, 0},
                                                 {NULL, 0, 0},
                                                 {NULL, 0, 0}};
 
-static inline int size2level (ssize_t size) {
-    /* Your code here.
-     * Convert the size to the correct power of two.
-     * Recall that the 0th entry in levels is really 2^5,
-     * the second level represents 2^6, etc.
-     */
+/* Data structure to track large objects (bigger than MAX_ALLOC.
+ * We will just do a simple linked-list by default.
+ *
+ * Extra credit to do something more substantial (or before seeing this code).
+ */
+struct big_object {
+    struct big_object *next;
+    void *addr;
+    size_t size;
+};
 
+// List of big objects
+static struct big_object *big_object_list = NULL;
+
+/* Convert the size to the correct power of two.
+ * Recall that the 0th entry in levels is really 2^5,
+ * the second level represents 2^6, etc.
+ *
+ * Return the index to the appropriate level (0..6), or
+ * -1 if the size is too large.
+ */
+
+static inline int size2level (ssize_t size) {
+    /* Your code here. */
     // Temporarily suppress the compiler warning that size is unused
     // You should remove the following line
     (void)(size);
     return 0;
 }
 
+/* This function allocates and initializes a new superblock.
+ *
+ * Note that a superblock in this lab is only one 4KiB page, not
+ * 8 KiB, as in the hoard paper.
+ *
+ * This design sacrifices the first entry in every superblock
+ * to store a superblock_bookkeeping structure.  Yes,
+ * it is a bit wasteful, but let's keep the exercise simple.
+ *
+ * power: the power of two to store in this superblock.  Note that
+ *        this is offset by 5; so a power zero means 2^5.
+ *
+ * Return value: a struct superblock_bookkeeping, which is
+ * embedded at the start of the superblock.  Or NULL on failure.
+ */
 static inline
 struct superblock_bookkeeping * alloc_super (int power) {
 
@@ -133,25 +167,31 @@ void *malloc(size_t size) {
     void *rv = NULL;
     int power = size2level(size);
 
-    // Check that the allocation isn't too big
+    // Handle bigger allocations with mmap, and a simple list
     if (size > MAX_ALLOC) {
-        errno = -ENOMEM;
-        return NULL;
+        // Why, yes we can do a recursive malloc.  But carefully...
+        struct big_object *biggun = malloc(sizeof(struct big_object));
+        biggun->next = big_object_list;
+        biggun->addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(biggun->addr);
+        biggun->size = size;
+        big_object_list = biggun;
+        return biggun->addr;
     }
 
     // Delete the following two lines
     errno = -ENOMEM;
     return rv;
 
-
     pool = &levels[power];
 
     if (!pool->free_objects) {
         bkeep = alloc_super(power);
-    } else
+    } else {
         bkeep = pool->next;
+    }
 
-    while (bkeep != NULL) {
+    for ( ; bkeep != NULL; bkeep = bkeep->next) {
         if (bkeep->free_count) {
             struct object *cursor = bkeep->free_list;
             /* Remove an object from the free list. */
@@ -159,11 +199,9 @@ void *malloc(size_t size) {
             //
             // NB: If you take the first object out of a whole
             //     superblock, decrement levels[power]->whole_superblocks
-
             // Temporarily suppress the compiler warning that cursor is unused
             // You should remove the following line
             (void)(cursor);
-
             break;
         }
     }
@@ -185,7 +223,33 @@ struct superblock_bookkeeping * obj2bkeep (void *ptr) {
 }
 
 void free(void *ptr) {
+
+    // Just ignore free of a null ptr
+    if (ptr == NULL) return;
+    
     struct superblock_bookkeeping *bkeep = obj2bkeep(ptr);
+    int power = bkeep->level;
+
+    // We need to check for free of any large objects first.
+    {
+        struct big_object *tmp, *last;
+        for(tmp = big_object_list, last = NULL; tmp; last = tmp, tmp = tmp->next) {
+            if (tmp->addr == ptr) {
+                // We found it
+                // Unmap the object
+                munmap(tmp->addr, tmp->size);
+                // Fix up the list
+                if (!last) {
+                    big_object_list = tmp->next;
+                } else {
+                    last->next = tmp->next;
+                }
+                // Free the node
+                free(tmp);
+                return;
+            }
+        }
+    }
 
     // Your code here.
     //   Be sure to put this back on the free list, and update the
@@ -196,11 +260,10 @@ void free(void *ptr) {
      * Hint: use FREE_POISON.
      */
 
-    while (levels[bkeep->level].whole_superblocks > RESERVE_SUPERBLOCK_THRESHOLD) {
+    while (levels[power].whole_superblocks > RESERVE_SUPERBLOCK_THRESHOLD) {
         // Exercise 4: Your code here
         // Remove a whole superblock from the level
         // Return that superblock to the OS, using mmunmap
-
         break; // hack to keep this loop from hanging; remove in ex 4
     }
 
